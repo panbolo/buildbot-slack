@@ -6,6 +6,7 @@ from twisted.internet import defer
 
 from buildbot.process.properties import Properties
 from buildbot.process.results import statusToString
+from buildbot.process import results
 from buildbot.reporters import http, utils
 from buildbot.util import httpclientservice
 from buildbot.util.logger import Logger
@@ -32,10 +33,29 @@ STATUS_COLORS = {
 }
 DEFAULT_HOST = "https://hooks.slack.com"  # deprecated
 
+def getValueOrDefault(key, default, **kwargs):
+    if key in kwargs:
+        return kwargs[key]
+    else:
+        return default
+
+def isSuccess(status):
+    return status != None and status == results.SUCCESS
+
+def isFailure(status):
+    return status != None and (status == results.FAILURE or status == results.EXCEPTION)
 
 class SlackStatusPush(http.HttpStatusPushBase):
     name = "SlackStatusPush"
     neededDetails = dict(wantProperties=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reportBuildStated = getValueOrDefault("reportBuildStated", True, **kwargs)
+        self.reportOnlyFailures = getValueOrDefault("reportOnlyFailures", False, **kwargs)
+        self.reportFixedBuild = getValueOrDefault("reportFixedBuild", False, **kwargs)
+        self.verify = getValueOrDefault("verify", False, **kwargs)
+        self.prevBuildResults = {}
 
     def checkConfig(
         self, endpoint, channel=None, host_url=None, username=None, **kwargs
@@ -108,53 +128,39 @@ class SlackStatusPush(http.HttpStatusPushBase):
         attachments = []
 
         for sourcestamp in sourcestamps:
-            sha = sourcestamp["revision"]
+            title = "<{url}|Build #{buildid}> - *{status}*".format(
+                url=build["url"], buildid=build["buildid"], status=statusToString(build["results"])
+            )
+            
+            blocks = []
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": title
+                    }
+                }
+            )
 
-            title = "Build #{buildid}".format(buildid=build["buildid"])
-            project = sourcestamp["project"]
-            if project:
-                title += " for {project} {sha}".format(project=project, sha=sha)
-            sub_build = bool(build["buildset"]["parent_buildid"])
-            if sub_build:
-                title += " {relationship}: #{parent_build_id}".format(
-                    relationship=build["buildset"]["parent_relationship"],
-                    parent_build_id=build["buildset"]["parent_buildid"],
-                )
-
-            fields = []
-            if not sub_build:
-                branch_name = sourcestamp["branch"]
-                if branch_name:
-                    fields.append(
-                        {"title": "Branch", "value": branch_name, "short": True}
-                    )
-                repositories = sourcestamp["repository"]
-                if repositories:
-                    fields.append(
-                        {"title": "Repository", "value": repositories, "short": True}
-                    )
-                responsible_users = yield utils.getResponsibleUsersForBuild(
-                    self.master, build["buildid"]
-                )
+            if build["results"] != results.SUCCESS:
+                responsible_users = yield utils.getResponsibleUsersForBuild(self.master, build["buildid"])
                 if responsible_users:
-                    fields.append(
+                    commiters = "*Commiters:*\n{}".format(", ".join(responsible_users))
+                    blocks.append(
                         {
-                            "title": "Commiters",
-                            "value": ", ".join(responsible_users),
-                            "short": True,
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": commiters
+                            }
                         }
                     )
+
             attachments.append(
                 {
-                    "title": title,
-                    "title_link": build["url"],
-                    "fallback": "{}: <{}>".format(title, build["url"]),
-                    "text": "Status: *{status}*".format(
-                        status=statusToString(build["results"])
-                    ),
                     "color": STATUS_COLORS.get(statusToString(build["results"]), ""),
-                    "mrkdwn_in": ["text", "title", "fallback"],
-                    "fields": fields,
+                    "blocks": blocks,
                 }
             )
         return attachments
@@ -162,15 +168,14 @@ class SlackStatusPush(http.HttpStatusPushBase):
     @defer.inlineCallbacks
     def getBuildDetailsAndSendMessage(self, build, key):
         yield utils.getDetailsForBuild(self.master, build, **self.neededDetails)
-        text = yield self.getMessage(build, key)
+        attachments = yield self.getAttachments(build, key)
+        
         postData = {}
-        if self.attachments:
-            attachments = yield self.getAttachments(build, key)
-            if attachments:
-                postData["attachments"] = attachments
-        else:
-            text += " here: " + build["url"]
-        postData["text"] = text
+        if key == "new":
+            postData["text"] = "Buildbot started build {}".format(build["builder"]["name"])
+        if key == "finished":
+            postData["text"] = "Buildbot finished build {}".format(build["builder"]["name"])
+            postData["attachments"] = attachments
 
         if self.channel:
             postData["channel"] = self.channel
@@ -182,21 +187,36 @@ class SlackStatusPush(http.HttpStatusPushBase):
         postData.update(extra_params)
         return postData
 
-    def getMessage(self, build, event_name):
-        event_messages = {
-            "new": "Buildbot started build %s" % build["builder"]["name"],
-            "finished": "Buildbot finished build %s with result: %s"
-            % (build["builder"]["name"], statusToString(build["results"])),
-        }
-        return event_messages.get(event_name, "")
-
     # returns a Deferred that returns None
     def buildStarted(self, key, build):
-        return self.send(build, key[2])
+        if self.reportBuildStated:
+            return self.send(build, key[2])
+        return None
 
     # returns a Deferred that returns None
+    @defer.inlineCallbacks
     def buildFinished(self, key, build):
-        return self.send(build, key[2])
+        yield utils.getDetailsForBuild(self.master, build)
+
+        doSend = False
+        if self.reportOnlyFailures:
+            if isFailure(build["results"]):
+                doSend = True
+
+            elif self.reportFixedBuild:
+                status = self.getPrevBuildResult(build)
+                if isSuccess(build["results"]) and isFailure(status):
+                    doSend = True
+                        
+        else:
+            doSend = True
+
+        if self.reportFixedBuild:
+            self.storePrevBuildResult(build)
+
+        if doSend:
+            return self.send(build, key[2])
+        return None
 
     def getExtraParams(self, build, event_name):
         return {}
@@ -235,3 +255,12 @@ class SlackStatusPush(http.HttpStatusPushBase):
                     sha=sha,
                     error=e,
                 )
+
+    def storePrevBuildResult(self, build):
+        self.prevBuildResults[build["builder"]["name"]] = build["results"]
+
+    def getPrevBuildResult(self, build):
+        if build["builder"]["name"] in self.prevBuildResults:
+            return self.prevBuildResults[build["builder"]["name"]]
+        else:
+            return None
