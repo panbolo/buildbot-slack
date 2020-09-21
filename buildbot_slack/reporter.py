@@ -172,7 +172,7 @@ class SlackStatusPush(http.HttpStatusPushBase):
         
         postData = {}
         if key == "new":
-            postData["text"] = "Buildbot started build {}".format(build["builder"]["name"])
+            postData["text"] = "Buildbot started build <{}|{}>".format(build["url"], build["builder"]["name"])
         if key == "finished":
             postData["text"] = "Buildbot finished build {}".format(build["builder"]["name"])
             postData["attachments"] = attachments
