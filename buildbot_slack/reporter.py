@@ -211,11 +211,12 @@ class SlackStatusPush(http.HttpStatusPushBase):
         else:
             doSend = True
 
-        if self.reportFixedBuild:
-            self.storePrevBuildResult(build)
-
         if doSend:
             return self.send(build, key[2])
+        
+        if not doSend and self.reportFixedBuild:
+            self.storePrevBuildResult(build)
+        
         return None
 
     def getExtraParams(self, build, event_name):
@@ -255,6 +256,9 @@ class SlackStatusPush(http.HttpStatusPushBase):
                     sha=sha,
                     error=e,
                 )
+        
+        if self.reportFixedBuild:
+            self.storePrevBuildResult(build)
 
     def storePrevBuildResult(self, build):
         self.prevBuildResults[build["builder"]["name"]] = build["results"]
